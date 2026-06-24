@@ -5,7 +5,7 @@ import argparse
 import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
+from confluent_kafka import Producer
 
 from cleaner import clean_post, generate_content_hash
 from engines import get_engine
@@ -22,13 +22,24 @@ logger = logging.getLogger("curiofeed.crawler.orchestrator")
 load_dotenv(".env.local")
 load_dotenv(".env")
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/curiofeed")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "curiofeed")
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "curiofeed.new_articles")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
-async def save_posts_to_db(posts: list[dict], source_name: str, test_mode: bool = False):
+# Khởi tạo Kafka Producer
+kafka_conf = {
+    'bootstrap.servers': KAFKA_BROKER,
+    'client.id': 'curiofeed-crawler'
+}
+try:
+    producer = Producer(kafka_conf)
+except Exception as e:
+    logger.error(f"❌ Không thể khởi tạo Kafka Producer: {str(e)}")
+    producer = None
+
+async def publish_posts_to_kafka(posts: list[dict], source_name: str, test_mode: bool = False):
     """
-    Làm sạch, check trùng lặp và lưu bài viết vào MongoDB
+    Làm sạch và đẩy bài viết vào Kafka
     """
     if not posts:
         logger.warning(f"  ❌ Không tìm thấy bài viết nào trên {source_name}")
@@ -53,15 +64,16 @@ async def save_posts_to_db(posts: list[dict], source_name: str, test_mode: bool 
         # Làm sạch bài viết
         cleaned_post = clean_post(post_data)
         if cleaned_post:
-            cleaned_post["created_at"] = datetime.now(timezone.utc)
-            cleaned_post["crawled_at"] = datetime.now(timezone.utc)
+            # Kafka cần JSON serializable datetime
+            cleaned_post["created_at"] = datetime.now(timezone.utc).isoformat()
+            cleaned_post["crawled_at"] = datetime.now(timezone.utc).isoformat()
             valid_posts.append(cleaned_post)
 
     if test_mode:
         print("\n" + "="*50)
         logger.info(f"✅ Hoàn tất! Tổng cộng {len(valid_posts)} bài viết hợp lệ.")
         print("="*50 + "\n")
-        print("📋 KẾT QUẢ TEST:\n")
+        print("📋 KẾT QUẢ TEST (SẼ ĐƯỢC ĐẨY VÀO KAFKA):\n")
         for i, p in enumerate(valid_posts[:5]): # In tối đa 5 bài
             print(f"--- Bài {i+1} ---")
             print(f"Hash: {p['content_hash']}")
@@ -70,36 +82,29 @@ async def save_posts_to_db(posts: list[dict], source_name: str, test_mode: bool 
             print(f"Reactions: {p['reactions']} | Nguồn: {p['source_name']} | Nền tảng: {p['platform']}\n")
         return len(valid_posts)
 
-    # Lưu vào Database
+    if not producer:
+        logger.error("  ❌ Kafka Producer chưa được khởi tạo!")
+        return 0
+
+    # Lưu vào Kafka
     try:
-        client = AsyncIOMotorClient(MONGODB_URI)
-        db = client[DATABASE_NAME]
-        collection = db.posts
-
-        saved_count = 0
-        duplicate_count = 0
-
+        published_count = 0
         for post in valid_posts:
-            try:
-                # Dùng content_hash làm _id hoặc index unique để chống trùng lặp
-                await collection.update_one(
-                    {"content_hash": post["content_hash"]},
-                    {"$setOnInsert": post},
-                    upsert=True
-                )
-                saved_count += 1
-            except Exception as e:
-                if "duplicate key error" in str(e).lower():
-                    duplicate_count += 1
-                else:
-                    logger.error(f"  ❌ Lỗi khi lưu DB: {str(e)}")
+            # Đẩy message, dùng content_hash làm message key để xử lý deduplication hoặc partitioning nếu cần
+            producer.produce(
+                KAFKA_TOPIC,
+                key=post["content_hash"],
+                value=json.dumps(post).encode('utf-8')
+            )
+            published_count += 1
 
-        client.close()
-        logger.info(f"  💾 Đã lưu: {saved_count} bài mới (Bỏ qua {duplicate_count} bài trùng lặp).")
-        return saved_count
+        # Chờ flush hết tất cả message lên broker
+        producer.flush()
+        logger.info(f"  🚀 Đã đẩy: {published_count} bài lên Kafka Topic '{KAFKA_TOPIC}'.")
+        return published_count
 
     except Exception as e:
-        logger.error(f"❌ Lỗi kết nối MongoDB: {str(e)}")
+        logger.error(f"❌ Lỗi kết nối Kafka: {str(e)}")
         return 0
 
 
@@ -135,8 +140,8 @@ async def crawl_all_sources(test_mode: bool = False):
             # Khởi chạy cào dữ liệu thô
             raw_posts = await engine.crawl(source, headless=HEADLESS)
             
-            # Làm sạch và lưu DB
-            await save_posts_to_db(raw_posts, source_name, test_mode)
+            # Làm sạch và đẩy lên Kafka
+            await publish_posts_to_kafka(raw_posts, source_name, test_mode)
             
         except Exception as e:
             logger.error(f"❌ Lỗi không xác định khi cào nguồn {source_name}: {str(e)}")
